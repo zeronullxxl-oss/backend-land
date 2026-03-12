@@ -163,7 +163,8 @@ async function sendFBEvent(lead) {
       action_source: 'website',
       event_source_url: (lead.utms && lead.utms.landing) || '',
       user_data: userData,
-    }]
+    }],
+    test_event_code: process.env.FB_TEST_CODE || 'TEST17622'
   };
   const result = await httpsPost('graph.facebook.com', `/v19.0/${pixelId}/events?access_token=${accessToken}`, payload);
   console.log('[FB CAPI]', result.status, result.body.slice(0, 150));
