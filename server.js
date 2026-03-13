@@ -48,8 +48,9 @@ const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '-1003578369883';
 // ── Facebook CAPI ─────────────────────────────────────────
 // Маппинг pixel_id -> access_token
 const FB_PIXELS = {
-  '3259080404253744': process.env.FB_TOKEN_PUMBA,    // pumba
-  '1237424481354094': process.env.FB_TOKEN_NEPRAVDA, // nepravda
+  '3259080404253744': process.env.FB_TOKEN_PUMBA,       // pumba
+  '1237424481354094': process.env.FB_TOKEN_NEPRAVDA_1,  // nepravda pixel 1
+  '711965651910969':  process.env.FB_TOKEN_NEPRAVDA_2,  // nepravda pixel 2
 };
 
 
