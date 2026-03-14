@@ -51,6 +51,8 @@ const FB_PIXELS = {
   '3259080404253744': process.env.FB_TOKEN_PUMBA,       // pumba
   '1237424481354094': process.env.FB_TOKEN_NEPRAVDA_1,  // nepravda pixel 1
   '711965651910969':  process.env.FB_TOKEN_NEPRAVDA_2,  // nepravda pixel 2
+  '4328533490710973': process.env.FB_TOKEN_NEPRAVDA_3,  // nepravda Mogilko
+  '4277414619193503': process.env.FB_TOKEN_NEPRAVDA_4,  // nepravda GPT
 };
 
 
