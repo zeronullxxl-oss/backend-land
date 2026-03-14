@@ -94,6 +94,8 @@ td{padding:14px 20px;font-size:14px}
 .td-ip{color:var(--muted);font-size:11px;font-family:monospace}
 .del-btn{padding:4px 12px;background:transparent;border:1px solid rgba(248,113,113,0.2);border-radius:8px;color:var(--red);font-size:12px;cursor:pointer;opacity:.6;transition:all .2s}
 .del-btn:hover{opacity:1;background:rgba(248,113,113,0.08)}
+.purchase-btn{padding:4px 10px;background:transparent;border:1px solid rgba(99,211,99,0.3);border-radius:8px;color:#6fd46f;font-size:12px;cursor:pointer;opacity:.7;transition:all .2s;margin-right:4px}
+.purchase-btn:hover{opacity:1;background:rgba(99,211,99,0.1)}
 .empty-state{padding:60px 20px;text-align:center;color:var(--muted)}
 .empty-state svg{margin-bottom:12px;opacity:.3}
 
@@ -361,7 +363,10 @@ function renderLeads(leads, total, page, pages) {
         <td class="td-phone">${esc(l.phone) || '—'}</td>
         <td class="td-ip">${esc(l.ip) || '—'}</td>
         <td class="td-time">${dateStr} <span style="color:var(--muted)">${timeStr}</span></td>
-        <td><button class="del-btn" onclick="deleteLead('${l.id}')">✕</button></td>
+        <td>
+          <button class="purchase-btn" onclick="sendPurchase('${l.id}')">💰</button>
+          <button class="del-btn" onclick="deleteLead('${l.id}')">✕</button>
+        </td>
       </tr>`;
     }).join('');
   }
@@ -391,6 +396,16 @@ async function deleteLead(id) {
     loadLeads();
     loadStats();
   } catch { toast('Ошибка удаления', 'error'); }
+}
+
+async function sendPurchase(id) {
+  if (!confirm('Отправить событие Purchase в Facebook для этого лида?')) return;
+  try {
+    const res = await fetch(`${API}/admin/purchase/${id}`, {method:'POST', headers:{'Authorization':'Bearer '+TOKEN}});
+    const data = await res.json();
+    if (data.ok) toast('💰 Purchase отправлен в Facebook!', 'success');
+    else toast('Ошибка: ' + (data.error || 'неизвестная'), 'error');
+  } catch { toast('Ошибка отправки Purchase', 'error'); }
 }
 
 function onSearch() {

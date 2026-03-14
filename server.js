@@ -132,10 +132,15 @@ function sendLeadToTelegram(lead) {
     chat_id: TG_CHAT_ID,
     text,
     reply_markup: {
-      inline_keyboard: [[
-        { text: '✅ Апрув', callback_data: `approve_${lead.id}` },
-        { text: '❌ Отклонить', callback_data: `reject_${lead.id}` }
-      ]]
+      inline_keyboard: [
+        [
+          { text: '✅ Апрув', callback_data: `approve_${lead.id}` },
+          { text: '❌ Отклонить', callback_data: `reject_${lead.id}` }
+        ],
+        [
+          { text: '💰 Purchase', callback_data: `purchase_${lead.id}` }
+        ]
+      ]
     }
   };
 
@@ -276,13 +281,79 @@ app.post('/tg-webhook', async (req, res) => {
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
         { callback_query_id: cbId, text: 'Апрув отправлен в Facebook!' });
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
-        { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: 'АПРУВНУТ', callback_data: 'done' }]] } });
+        { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [
+          [{ text: '✅ АПРУВНУТ', callback_data: 'done' }],
+          [{ text: '💰 Purchase', callback_data: `purchase_${leadId}` }]
+        ]}});
     } else {
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
         { callback_query_id: cbId, text: 'Лид отклонён' });
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
-        { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: 'ОТКЛОНЁН', callback_data: 'done' }]] } });
+        { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '❌ ОТКЛОНЁН', callback_data: 'done' }]] } });
     }
+  }
+
+  // Purchase — шаг 1: запрос подтверждения
+  if (data_str.startsWith('purchase_')) {
+    const leadId = data_str.replace('purchase_', '');
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+      { callback_query_id: cbId, text: 'Подтвердите отправку Purchase' });
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/sendMessage`, {
+      chat_id: chatId,
+      text: `💰 Отправить событие Purchase для лида ${leadId.slice(0,8).toUpperCase()}?`,
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Да, отправить', callback_data: `purchase_confirm_${leadId}` },
+        { text: '❌ Отмена', callback_data: `purchase_cancel_${leadId}` }
+      ]]}
+    });
+  }
+
+  // Purchase — шаг 2: подтверждение
+  if (data_str.startsWith('purchase_confirm_')) {
+    const leadId = data_str.replace('purchase_confirm_', '');
+    const { rows } = await pool.query(`SELECT * FROM leads WHERE id=$1`, [leadId]);
+    if (rows[0]) {
+      rows[0].utms = rows[0].utms || {};
+      const pixelId = rows[0].utms.pixel_id;
+      const accessToken = FB_PIXELS[pixelId];
+      if (!pixelId || !accessToken) {
+        await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+          { callback_query_id: cbId, text: 'Ошибка: нет pixel_id или токена' });
+        return;
+      }
+      const eventTime = Math.floor(Date.now() / 1000);
+      const hash = (val) => val ? require('crypto').createHash('sha256').update(val.trim().toLowerCase()).digest('hex') : undefined;
+      const userData = {};
+      if (rows[0].email) userData.em = [hash(rows[0].email)];
+      if (rows[0].phone) userData.ph = [hash(rows[0].phone.replace(/\D/g,''))];
+      if (rows[0].ip) userData.client_ip_address = rows[0].ip;
+      const payload = {
+        data: [{
+          event_name: 'Purchase',
+          event_time: eventTime,
+          action_source: 'website',
+          event_source_url: rows[0].utms.landing || '',
+          user_data: userData,
+          custom_data: { currency: 'USD', value: 500 }
+        }]
+      };
+      if (process.env.FB_TEST_CODE) payload.test_event_code = process.env.FB_TEST_CODE;
+      const result = await httpsPost('graph.facebook.com', `/v19.0/${pixelId}/events?access_token=${accessToken}`, payload);
+      console.log('[FB CAPI Purchase]', result.status, result.body.slice(0, 150));
+      await pool.query(`UPDATE leads SET status='purchased' WHERE id=$1`, [leadId]);
+      await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+        { callback_query_id: cbId, text: '💰 Purchase отправлен в Facebook!' });
+      await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
+        { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '💰 PURCHASE ОТПРАВЛЕН', callback_data: 'done' }]] } });
+    }
+  }
+
+  // Purchase — отмена
+  if (data_str.startsWith('purchase_cancel_')) {
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+      { callback_query_id: cbId, text: 'Отменено' });
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
+      { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '❌ Отменено', callback_data: 'done' }]] } });
   }
 });
 
@@ -341,6 +412,41 @@ app.get('/admin/leads', authMiddleware, async (req, res) => {
   );
 
   res.json({ total: parseInt(countRes.rows[0].count), leads: leadsRes.rows });
+});
+
+app.post('/admin/purchase/:id', authMiddleware, async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM leads WHERE id=$1`, [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ ok: false, error: 'Lead not found' });
+  const lead = rows[0];
+  lead.utms = lead.utms || {};
+  const pixelId = lead.utms.pixel_id;
+  const accessToken = FB_PIXELS[pixelId];
+  if (!pixelId || !accessToken) return res.status(400).json({ ok: false, error: 'No pixel_id or token for this lead' });
+  const eventTime = Math.floor(Date.now() / 1000);
+  const hash = (val) => val ? crypto.createHash('sha256').update(val.trim().toLowerCase()).digest('hex') : undefined;
+  const userData = {};
+  if (lead.email) userData.em = [hash(lead.email)];
+  if (lead.phone) userData.ph = [hash(lead.phone.replace(/\D/g,''))];
+  if (lead.ip)    userData.client_ip_address = lead.ip;
+  const payload = {
+    data: [{
+      event_name: 'Purchase',
+      event_time: eventTime,
+      action_source: 'website',
+      event_source_url: lead.utms.landing || '',
+      user_data: userData,
+      custom_data: { currency: 'USD', value: 500 }
+    }]
+  };
+  if (process.env.FB_TEST_CODE) payload.test_event_code = process.env.FB_TEST_CODE;
+  const result = await httpsPost('graph.facebook.com', `/v19.0/${pixelId}/events?access_token=${accessToken}`, payload);
+  console.log('[FB CAPI Purchase CRM]', result.status, result.body.slice(0, 150));
+  if (result.status === 200) {
+    await pool.query(`UPDATE leads SET status='purchased' WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } else {
+    res.status(400).json({ ok: false, error: result.body });
+  }
 });
 
 app.delete('/admin/lead/:id', authMiddleware, async (req, res) => {
