@@ -275,7 +275,8 @@ app.post('/tg-webhook', async (req, res) => {
     if (isApprove) {
       const { rows } = await pool.query(`SELECT * FROM leads WHERE id=$1`, [leadId]);
       if (rows[0]) {
-        rows[0].utms = rows[0].utms || {};
+        rows[0].utms = typeof rows[0].utms === 'string' ? JSON.parse(rows[0].utms) : (rows[0].utms || {});
+        console.log('[APPROVE] pixel_id from DB:', rows[0].utms.pixel_id, '| buyer:', rows[0].buyer);
         await sendFBEvent(rows[0]);
       }
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
@@ -291,21 +292,6 @@ app.post('/tg-webhook', async (req, res) => {
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
         { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '❌ ОТКЛОНЁН', callback_data: 'done' }]] } });
     }
-  }
-
-  // Purchase — шаг 1: запрос подтверждения
-  if (data_str.startsWith('purchase_')) {
-    const leadId = data_str.replace('purchase_', '');
-    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
-      { callback_query_id: cbId, text: 'Подтвердите отправку Purchase' });
-    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/sendMessage`, {
-      chat_id: chatId,
-      text: `💰 Отправить событие Purchase для лида ${leadId.slice(0,8).toUpperCase()}?`,
-      reply_markup: { inline_keyboard: [[
-        { text: '✅ Да, отправить', callback_data: `purchase_confirm_${leadId}` },
-        { text: '❌ Отмена', callback_data: `purchase_cancel_${leadId}` }
-      ]]}
-    });
   }
 
   // Purchase — шаг 2: подтверждение
@@ -355,6 +341,22 @@ app.post('/tg-webhook', async (req, res) => {
     await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
       { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '❌ Отменено', callback_data: 'done' }]] } });
   }
+
+  // Purchase — шаг 1: запрос подтверждения
+  if (data_str.startsWith('purchase_')) {
+    const leadId = data_str.replace('purchase_', '');
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+      { callback_query_id: cbId, text: 'Подтвердите отправку Purchase' });
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/sendMessage`, {
+      chat_id: chatId,
+      text: `💰 Отправить событие Purchase для лида ${leadId.slice(0,8).toUpperCase()}?`,
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Да, отправить', callback_data: `purchase_confirm_${leadId}` },
+        { text: '❌ Отмена', callback_data: `purchase_cancel_${leadId}` }
+      ]]}
+    });
+  }
+
 });
 
 app.post('/admin/auth', (req, res) => {
