@@ -164,6 +164,10 @@ td{padding:14px 20px;font-size:14px}
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
       <span>Лиды <span id="leadsCount" style="background:rgba(16,163,127,0.2);color:#10A37F;border-radius:20px;padding:1px 7px;font-size:11px;margin-left:4px">0</span></span>
     </div>
+    <div class="nav-item" onclick="showTab('pixels')" id="nav-pixels">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+      <span>Пиксели</span>
+    </div>
     <div class="sidebar-bottom">
       <div style="font-size:12px;color:var(--muted);margin-bottom:10px;padding:0 4px">
         <span id="buyerLabel" style="font-weight:600;color:var(--text)"></span>
@@ -228,6 +232,52 @@ td{padding:14px 20px;font-size:14px}
         </div>
       </div>
 
+      <!-- Pixels tab -->
+      <div class="tab-pane" id="tab-pixels">
+        <!-- Add pixel form -->
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:24px">
+          <div style="font-size:14px;font-weight:600;margin-bottom:16px">Добавить пиксель</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+            <div style="flex:1;min-width:160px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Pixel ID</label>
+              <input class="login-input" id="pxId" placeholder="1234567890" style="margin:0;padding:10px 12px;font-size:13px">
+            </div>
+            <div style="flex:2;min-width:200px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Access Token</label>
+              <input class="login-input" id="pxToken" placeholder="EAAxxxxxxx..." style="margin:0;padding:10px 12px;font-size:13px" type="password">
+            </div>
+            <div style="flex:1;min-width:120px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Label</label>
+              <input class="login-input" id="pxLabel" placeholder="Название" style="margin:0;padding:10px 12px;font-size:13px">
+            </div>
+            <div id="pxBuyerWrap" style="flex:1;min-width:100px;display:none">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Buyer</label>
+              <input class="login-input" id="pxBuyer" placeholder="buyer" style="margin:0;padding:10px 12px;font-size:13px">
+            </div>
+            <button class="login-btn" onclick="addPixel()" style="padding:10px 20px;border-radius:10px;font-size:13px;width:auto;white-space:nowrap">+ Добавить</button>
+          </div>
+        </div>
+        <!-- Pixels list -->
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Pixel ID</th>
+                <th>Token</th>
+                <th>Buyer</th>
+                <th>Label</th>
+                <th>Test Code</th>
+                <th>Дата</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="pixelsBody">
+              <tr><td colspan="7"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
@@ -244,6 +294,7 @@ let currentPage = 1;
 let searchTerm = '';
 let searchTimer = null;
 let currentTab = 'dashboard';
+let isSuper = false;
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────
 async function login() {
@@ -258,12 +309,14 @@ async function login() {
     });
     const d = await r.json();
     if (!d.ok) throw new Error();
-    TOKEN = d.token; // формат "login:password"
-    // Показываем имя байера в сайдбаре
+    TOKEN = d.token;
+    isSuper = d.isSuper || false;
     document.getElementById('buyerLabel').textContent = d.name || login;
     document.getElementById('superBadge').style.display = d.isSuper ? 'inline' : 'none';
     document.getElementById('loginScreen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
+    // Показываем поле buyer для админа в форме пикселей
+    if (isSuper) document.getElementById('pxBuyerWrap').style.display = 'block';
     loadStats();
     loadLeads();
   } catch {
@@ -287,13 +340,16 @@ function showTab(tab) {
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + tab).classList.add('active');
   document.getElementById('nav-' + tab).classList.add('active');
-  document.getElementById('topbarTitle').textContent = tab === 'dashboard' ? 'Дашборд' : 'Лиды';
+  const titles = { dashboard: 'Дашборд', leads: 'Лиды', pixels: 'Пиксели FB CAPI' };
+  document.getElementById('topbarTitle').textContent = titles[tab] || tab;
   if (tab === 'leads') loadLeads();
   if (tab === 'dashboard') loadStats();
+  if (tab === 'pixels') loadPixels();
 }
 
 function refreshCurrent() {
   if (currentTab === 'dashboard') loadStats();
+  else if (currentTab === 'pixels') loadPixels();
   else loadLeads();
 }
 
@@ -353,7 +409,7 @@ function renderLeads(leads, total, page, pages) {
   } else {
     const offset = (page - 1) * 50;
     body.innerHTML = leads.map((l, i) => {
-      const dt = new Date(l.createdAt);
+      const dt = new Date(l.created_at);
       const dateStr = dt.toLocaleDateString('ru', {day:'2-digit',month:'2-digit',year:'2-digit'});
       const timeStr = dt.toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit'});
       return `<tr>
@@ -433,6 +489,129 @@ function exportCSV(e) {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     });
+}
+
+// ── PIXELS ────────────────────────────────────────────────────────────────────
+async function loadPixels() {
+  const body = document.getElementById('pixelsBody');
+  body.innerHTML = '<tr><td colspan="7"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>';
+  try {
+    const r = await fetch(`${API}/admin/pixels`, {headers:{'Authorization':'Bearer '+TOKEN}});
+    const d = await r.json();
+    if (!d.pixels || !d.pixels.length) {
+      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">Пикселей пока нет — добавьте первый</div></td></tr>';
+      return;
+    }
+    body.innerHTML = d.pixels.map(p => {
+      const dt = new Date(p.created_at);
+      const dateStr = dt.toLocaleDateString('ru',{day:'2-digit',month:'2-digit',year:'2-digit'});
+      const hasTest = p.test_code && p.test_code.length > 0;
+      const testBadge = hasTest
+        ? `<span style="background:rgba(251,191,36,0.15);color:var(--yellow);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;cursor:pointer" onclick="toggleTestCode('${esc(p.pixel_id)}','')" title="Клик = выключить тест">${esc(p.test_code)}</span>`
+        : `<span style="color:var(--green);font-size:12px;cursor:pointer" onclick="toggleTestCode('${esc(p.pixel_id)}','prompt')" title="Клик = включить тест">● PROD</span>`;
+      return `<tr>
+        <td style="font-family:monospace;font-size:13px">${esc(p.pixel_id)}</td>
+        <td style="color:var(--muted);font-size:12px">••••••••</td>
+        <td>${esc(p.buyer)}</td>
+        <td style="color:var(--muted)">${esc(p.label)||'—'}</td>
+        <td>${testBadge}</td>
+        <td class="td-time">${dateStr}</td>
+        <td style="white-space:nowrap">
+          <button class="purchase-btn" onclick="testPixel('${esc(p.pixel_id)}')" title="Отправить тест-событие">🧪</button>
+          <button class="purchase-btn" onclick="editPixelToken('${esc(p.pixel_id)}')" title="Сменить токен">✏️</button>
+          <button class="del-btn" onclick="deletePixel('${esc(p.pixel_id)}')">✕</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    body.innerHTML = '<tr><td colspan="7"><div class="empty-state">Ошибка загрузки</div></td></tr>';
+  }
+}
+
+async function addPixel() {
+  const pixel_id = document.getElementById('pxId').value.trim();
+  const access_token = document.getElementById('pxToken').value.trim();
+  const label = document.getElementById('pxLabel').value.trim();
+  const buyer = document.getElementById('pxBuyer').value.trim();
+  if (!pixel_id || !access_token) { toast('Заполните Pixel ID и Token','error'); return; }
+  try {
+    const body = { pixel_id, access_token, label, test_code: '' };
+    if (isSuper && buyer) body.buyer = buyer;
+    const r = await fetch(`${API}/admin/pixels`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast('Пиксель добавлен','success');
+      document.getElementById('pxId').value='';
+      document.getElementById('pxToken').value='';
+      document.getElementById('pxLabel').value='';
+      document.getElementById('pxBuyer').value='';
+      loadPixels();
+    } else { toast(d.error||'Ошибка','error'); }
+  } catch { toast('Ошибка сети','error'); }
+}
+
+async function toggleTestCode(pixelId, action) {
+  let newCode = '';
+  if (action === 'prompt') {
+    newCode = prompt('Test Event Code из Events Manager (пусто = отключить):','');
+    if (newCode === null) return; // отмена
+  }
+  // action === '' → выключаем тест (ставим пустую строку)
+  try {
+    const r = await fetch(`${API}/admin/pixels/${pixelId}`, {
+      method:'PUT', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+      body: JSON.stringify({ test_code: newCode.trim() })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast(newCode ? '🧪 Тест-режим включён' : '✅ Продакшн-режим','success');
+      loadPixels();
+    } else toast(d.error||'Ошибка','error');
+  } catch { toast('Ошибка сети','error'); }
+}
+
+async function editPixelToken(pixelId) {
+  const newToken = prompt('Новый access_token для пикселя ' + pixelId + ':');
+  if (!newToken) return;
+  try {
+    const r = await fetch(`${API}/admin/pixels/${pixelId}`, {
+      method:'PUT', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+      body: JSON.stringify({ access_token: newToken })
+    });
+    const d = await r.json();
+    if (d.ok) { toast('Токен обновлён','success'); loadPixels(); }
+    else toast(d.error||'Ошибка','error');
+  } catch { toast('Ошибка сети','error'); }
+}
+
+async function deletePixel(pixelId) {
+  if (!confirm('Удалить пиксель ' + pixelId + '?')) return;
+  try {
+    const r = await fetch(`${API}/admin/pixels/${pixelId}`, {
+      method:'DELETE', headers:{'Authorization':'Bearer '+TOKEN}
+    });
+    const d = await r.json();
+    if (d.ok) { toast('Пиксель удалён','success'); loadPixels(); }
+    else toast(d.error||'Ошибка','error');
+  } catch { toast('Ошибка сети','error'); }
+}
+
+async function testPixel(pixelId) {
+  const testCode = prompt('Test Event Code (из Events Manager):', 'TEST00000');
+  if (!testCode) return;
+  toast('Отправляю тестовое событие...','success');
+  try {
+    const r = await fetch(`${API}/admin/pixels/${pixelId}/test`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+      body: JSON.stringify({ test_code: testCode })
+    });
+    const d = await r.json();
+    if (d.ok) toast('✅ Тест OK! Проверьте Events Manager','success');
+    else toast('❌ Ошибка: ' + JSON.stringify(d.response||d.error).slice(0,100),'error');
+  } catch { toast('Ошибка сети','error'); }
 }
 
 // ── TOAST ─────────────────────────────────────────────────────────────────────

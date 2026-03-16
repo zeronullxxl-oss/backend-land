@@ -28,7 +28,36 @@ async function initDB() {
       count INTEGER DEFAULT 0
     );
     INSERT INTO visits (id, count) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
+    CREATE TABLE IF NOT EXISTS pixels (
+      pixel_id TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      buyer TEXT NOT NULL,
+      label TEXT DEFAULT '',
+      test_code TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
+  // Добавляем колонку test_code если таблица уже существовала без неё
+  await pool.query(`ALTER TABLE pixels ADD COLUMN IF NOT EXISTS test_code TEXT DEFAULT ''`).catch(()=>{});
+  // Seed из ENV — только если таблица пустая (первый запуск)
+  const { rows } = await pool.query(`SELECT COUNT(*) FROM pixels`);
+  if (parseInt(rows[0].count) === 0) {
+    const seeds = [
+      ['3259080404253744', process.env.FB_TOKEN_PUMBA,      'pumba',    'pumba основной'],
+      ['1237424481354094', process.env.FB_TOKEN_NEPRAVDA_1, 'nepravda', 'nepravda pixel 1'],
+      ['711965651910969',  process.env.FB_TOKEN_NEPRAVDA_2, 'nepravda', 'nepravda pixel 2'],
+      ['4328533490710973', process.env.FB_TOKEN_NEPRAVDA_3, 'nepravda', 'Mogilko'],
+      ['4277414619193503', process.env.FB_TOKEN_NEPRAVDA_4, 'nepravda', 'GPT'],
+    ];
+    for (const [pid, token, buyer, label] of seeds) {
+      if (token) {
+        await pool.query(`INSERT INTO pixels (pixel_id, access_token, buyer, label) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+          [pid, token, buyer, label]);
+      }
+    }
+    console.log('[DB] pixels seeded from ENV');
+  }
+  await refreshPixelCache();
   console.log('[DB] initialized');
 }
 
@@ -45,15 +74,26 @@ const SUPER_PASSWORD = process.env.SUPER_PASSWORD || 'supersecret2025';
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '8601777567:AAFyBTaF_uM65ueCJvM4YHCZfu8_7Q08Ezg';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '-1003578369883';
 
-// ── Facebook CAPI ─────────────────────────────────────────
-// Маппинг pixel_id -> access_token
-const FB_PIXELS = {
-  '3259080404253744': process.env.FB_TOKEN_PUMBA,       // pumba
-  '1237424481354094': process.env.FB_TOKEN_NEPRAVDA_1,  // nepravda pixel 1
-  '711965651910969':  process.env.FB_TOKEN_NEPRAVDA_2,  // nepravda pixel 2
-  '4328533490710973': process.env.FB_TOKEN_NEPRAVDA_3,  // nepravda Mogilko
-  '4277414619193503': process.env.FB_TOKEN_NEPRAVDA_4,  // nepravda GPT
-};
+// ── Facebook CAPI — динамический кеш из БД ──────────────
+let FB_PIXELS = {}; // pixel_id -> access_token (кеш, обновляется из БД)
+let FB_PIXELS_META = {}; // pixel_id -> { buyer, label, test_code }
+
+async function refreshPixelCache() {
+  try {
+    const { rows } = await pool.query(`SELECT pixel_id, access_token, buyer, label, test_code FROM pixels`);
+    const newPixels = {};
+    const newMeta = {};
+    rows.forEach(r => {
+      newPixels[r.pixel_id] = r.access_token;
+      newMeta[r.pixel_id] = { buyer: r.buyer, label: r.label, test_code: r.test_code || '' };
+    });
+    FB_PIXELS = newPixels;
+    FB_PIXELS_META = newMeta;
+    console.log(`[PIXELS] cache refreshed: ${rows.length} pixels`);
+  } catch (err) {
+    console.error('[PIXELS] cache refresh error:', err.message);
+  }
+}
 
 
 // ── HTTPS helpers ─────────────────────────────────────────
@@ -154,10 +194,6 @@ async function sendFBEvent(lead) {
   if (!pixelId) { console.log('[FB CAPI] no pixel_id, skipping'); return; }
   const accessToken = FB_PIXELS[pixelId];
   if (!accessToken) { console.log('[FB CAPI] no token for pixel', pixelId, '- skipping'); return; }
-  if (!accessToken) {
-    console.log(`[FB CAPI] unknown pixel_id: ${pixelId}`);
-    return;
-  }
   console.log(`[FB CAPI] using pixel ${pixelId}`);
   const eventTime = Math.floor(Date.now() / 1000);
   const hash = (val) => val ? crypto.createHash('sha256').update(val.trim().toLowerCase()).digest('hex') : undefined;
@@ -165,19 +201,59 @@ async function sendFBEvent(lead) {
   if (lead.email) userData.em = [hash(lead.email)];
   if (lead.phone) userData.ph = [hash(lead.phone.replace(/\D/g,''))];
   if (lead.ip)    userData.client_ip_address = lead.ip;
-  if (lead.utms && lead.utms.fbclid) userData.fbc = `fb.1.${eventTime}.${lead.utms.fbclid}`;
+  if (lead.utms && lead.utms.fbclid) {
+    // fbc: timestamp ближе к клику (created_at лида), а не к апруву
+    const clickTime = lead.created_at ? Math.floor(new Date(lead.created_at).getTime() / 1000) : eventTime;
+    userData.fbc = `fb.1.${clickTime}.${lead.utms.fbclid}`;
+  }
+  if (lead.id) userData.external_id = [hash(lead.id)];
+  const eventId = `lead_${lead.id}_${eventTime}`;
   const payload = {
     data: [{
       event_name: 'Lead',
       event_time: eventTime,
+      event_id: eventId,
       action_source: 'website',
       event_source_url: (lead.utms && lead.utms.landing) || '',
       user_data: userData,
-    }],
-    test_event_code: process.env.FB_TEST_CODE || 'TEST71321'
+    }]
   };
-  const result = await httpsPost('graph.facebook.com', `/v19.0/${pixelId}/events?access_token=${accessToken}`, payload);
-  console.log('[FB CAPI]', result.status, result.body.slice(0, 150));
+  const pixelTestCode = (FB_PIXELS_META[pixelId] && FB_PIXELS_META[pixelId].test_code) || '';
+  if (pixelTestCode) payload.test_event_code = pixelTestCode;
+  const result = await httpsPost('graph.facebook.com', `/v21.0/${pixelId}/events?access_token=${accessToken}`, payload);
+  console.log(`[FB CAPI] pixel=${pixelId} test=${pixelTestCode||'OFF'}`, result.status, result.body.slice(0, 150));
+  return result;
+}
+
+// ── FB CAPI Purchase (общая функция для TG и CRM) ────────
+async function sendFBPurchase(lead) {
+  const pixelId = lead.utms && lead.utms.pixel_id;
+  if (!pixelId) return null;
+  const accessToken = FB_PIXELS[pixelId];
+  if (!accessToken) return null;
+  const eventTime = Math.floor(Date.now() / 1000);
+  const hash = (val) => val ? crypto.createHash('sha256').update(val.trim().toLowerCase()).digest('hex') : undefined;
+  const userData = {};
+  if (lead.email) userData.em = [hash(lead.email)];
+  if (lead.phone) userData.ph = [hash(lead.phone.replace(/\D/g,''))];
+  if (lead.ip)    userData.client_ip_address = lead.ip;
+  if (lead.id)    userData.external_id = [hash(lead.id)];
+  const eventId = `purchase_${lead.id}_${eventTime}`;
+  const payload = {
+    data: [{
+      event_name: 'Purchase',
+      event_time: eventTime,
+      event_id: eventId,
+      action_source: 'website',
+      event_source_url: (lead.utms && lead.utms.landing) || '',
+      user_data: userData,
+      custom_data: { currency: 'USD', value: 500 }
+    }]
+  };
+  const pixelTestCode = (FB_PIXELS_META[pixelId] && FB_PIXELS_META[pixelId].test_code) || '';
+  if (pixelTestCode) payload.test_event_code = pixelTestCode;
+  const result = await httpsPost('graph.facebook.com', `/v21.0/${pixelId}/events?access_token=${accessToken}`, payload);
+  console.log(`[FB CAPI Purchase] pixel=${pixelId} test=${pixelTestCode||'OFF'}`, result.status, result.body.slice(0, 150));
   return result;
 }
 
@@ -196,7 +272,7 @@ function authenticateBuyer(token) {
 function authMiddleware(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-  const token = req.headers['x-auth-token'] || bearerToken || req.query.token || '';
+  const token = req.headers['x-auth-token'] || bearerToken || req.query.token || req.query.auth || '';
   const buyer = authenticateBuyer(token);
   if (!buyer) return res.status(401).json({ error: 'Unauthorized' });
   req.buyer = buyer;
@@ -208,7 +284,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -216,44 +292,53 @@ app.use((req, res, next) => {
 // ── Routes ────────────────────────────────────────────────
 
 app.post('/lead', async (req, res) => {
-  const { name, email, phone, buyer: buyerField, utms } = req.body;
-  if (!name && !email && !phone) return res.status(400).json({ error: 'Empty lead' });
+  try {
+    const { name, email, phone, buyer: buyerField, utms } = req.body;
+    if (!name && !email && !phone) return res.status(400).json({ error: 'Empty lead' });
 
-  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || '';
-  const geo = await getGeo(ip);
+    const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || '';
+    const geo = await getGeo(ip);
 
-  const lead = {
-    id: crypto.randomUUID(),
-    name:  name  || '',
-    email: email || '',
-    phone: phone || '',
-    buyer: buyerField || 'unknown',
-    ip,
-    ua: req.headers['user-agent'] || '',
-    country: geo.country_name || '',
-    city:    geo.city || '',
-    flag:    geo.country || '',
-    utms: utms || {},
-    status: 'pending',
-  };
+    const lead = {
+      id: crypto.randomUUID(),
+      name:  name  || '',
+      email: email || '',
+      phone: phone || '',
+      buyer: buyerField || 'unknown',
+      ip,
+      ua: req.headers['user-agent'] || '',
+      country: geo.country_name || '',
+      city:    geo.city || '',
+      flag:    geo.country || '',
+      utms: utms || {},
+      status: 'pending',
+    };
 
-  await pool.query(
-    `INSERT INTO leads (id,name,email,phone,buyer,ip,ua,country,city,flag,utms,status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-    [lead.id, lead.name, lead.email, lead.phone, lead.buyer, lead.ip, lead.ua,
-     lead.country, lead.city, lead.flag, JSON.stringify(lead.utms), lead.status]
-  );
+    await pool.query(
+      `INSERT INTO leads (id,name,email,phone,buyer,ip,ua,country,city,flag,utms,status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [lead.id, lead.name, lead.email, lead.phone, lead.buyer, lead.ip, lead.ua,
+       lead.country, lead.city, lead.flag, JSON.stringify(lead.utms), lead.status]
+    );
 
-  // Визит не считаем здесь — только лид
-  console.log(`[LEAD] ${lead.name} | ${lead.email} | ${lead.phone} | ${lead.buyer} | ${lead.country}`);
-  sendLeadToTelegram(lead);
+    console.log(`[LEAD] ${lead.name} | ${lead.email} | ${lead.phone} | ${lead.buyer} | ${lead.country}`);
+    sendLeadToTelegram(lead);
 
-  res.json({ ok: true, id: lead.id });
+    res.json({ ok: true, id: lead.id });
+  } catch (err) {
+    console.error('[LEAD ERROR]', err.message);
+    res.status(500).json({ ok: false, error: 'Internal error' });
+  }
 });
 
 app.post('/visit', async (req, res) => {
-  await pool.query(`UPDATE visits SET count = count + 1 WHERE id = 1`);
-  res.json({ ok: true });
+  try {
+    await pool.query(`UPDATE visits SET count = count + 1 WHERE id = 1`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[VISIT ERROR]', err.message);
+    res.status(500).json({ ok: false });
+  }
 });
 
 app.post('/tg-webhook', async (req, res) => {
@@ -265,6 +350,7 @@ app.post('/tg-webhook', async (req, res) => {
   const chatId = cb.message && cb.message.chat && cb.message.chat.id;
   const cbId   = cb.id;
 
+  // ── Approve / Reject ──
   if (data_str.startsWith('approve_') || data_str.startsWith('reject_')) {
     const isApprove = data_str.startsWith('approve_');
     const leadId = data_str.replace(/^(approve|reject)_/, '');
@@ -292,57 +378,45 @@ app.post('/tg-webhook', async (req, res) => {
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
         { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '❌ ОТКЛОНЁН', callback_data: 'done' }]] } });
     }
+    return;
   }
 
-  // Purchase — шаг 2: подтверждение
+  // ── Purchase — шаг 2: подтверждение ──
   if (data_str.startsWith('purchase_confirm_')) {
     const leadId = data_str.replace('purchase_confirm_', '');
     const { rows } = await pool.query(`SELECT * FROM leads WHERE id=$1`, [leadId]);
-    if (rows[0]) {
-      rows[0].utms = rows[0].utms || {};
-      const pixelId = rows[0].utms.pixel_id;
-      const accessToken = FB_PIXELS[pixelId];
-      if (!pixelId || !accessToken) {
-        await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
-          { callback_query_id: cbId, text: 'Ошибка: нет pixel_id или токена' });
-        return;
-      }
-      const eventTime = Math.floor(Date.now() / 1000);
-      const hash = (val) => val ? require('crypto').createHash('sha256').update(val.trim().toLowerCase()).digest('hex') : undefined;
-      const userData = {};
-      if (rows[0].email) userData.em = [hash(rows[0].email)];
-      if (rows[0].phone) userData.ph = [hash(rows[0].phone.replace(/\D/g,''))];
-      if (rows[0].ip) userData.client_ip_address = rows[0].ip;
-      const payload = {
-        data: [{
-          event_name: 'Purchase',
-          event_time: eventTime,
-          action_source: 'website',
-          event_source_url: rows[0].utms.landing || '',
-          user_data: userData,
-          custom_data: { currency: 'USD', value: 500 }
-        }]
-      };
-      if (process.env.FB_TEST_CODE) payload.test_event_code = process.env.FB_TEST_CODE;
-      const result = await httpsPost('graph.facebook.com', `/v19.0/${pixelId}/events?access_token=${accessToken}`, payload);
-      console.log('[FB CAPI Purchase]', result.status, result.body.slice(0, 150));
-      await pool.query(`UPDATE leads SET status='purchased' WHERE id=$1`, [leadId]);
+    if (!rows[0]) return;
+    // Защита от двойного Purchase
+    if (rows[0].status === 'purchased') {
       await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
-        { callback_query_id: cbId, text: '💰 Purchase отправлен в Facebook!' });
-      await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
-        { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '💰 PURCHASE ОТПРАВЛЕН', callback_data: 'done' }]] } });
+        { callback_query_id: cbId, text: '⚠️ Purchase уже отправлен ранее' });
+      return;
     }
+    rows[0].utms = rows[0].utms || {};
+    const result = await sendFBPurchase(rows[0]);
+    if (!result) {
+      await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+        { callback_query_id: cbId, text: 'Ошибка: нет pixel_id или токена' });
+      return;
+    }
+    await pool.query(`UPDATE leads SET status='purchased' WHERE id=$1`, [leadId]);
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
+      { callback_query_id: cbId, text: '💰 Purchase отправлен в Facebook!' });
+    await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
+      { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '💰 PURCHASE ОТПРАВЛЕН', callback_data: 'done' }]] } });
+    return;
   }
 
-  // Purchase — отмена
+  // ── Purchase — отмена ──
   if (data_str.startsWith('purchase_cancel_')) {
     await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
       { callback_query_id: cbId, text: 'Отменено' });
     await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/editMessageReplyMarkup`,
       { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [[{ text: '❌ Отменено', callback_data: 'done' }]] } });
+    return;
   }
 
-  // Purchase — шаг 1: запрос подтверждения
+  // ── Purchase — шаг 1: запрос подтверждения ──
   if (data_str.startsWith('purchase_')) {
     const leadId = data_str.replace('purchase_', '');
     await httpsPost('api.telegram.org', `/bot${TG_BOT_TOKEN}/answerCallbackQuery`,
@@ -355,6 +429,7 @@ app.post('/tg-webhook', async (req, res) => {
         { text: '❌ Отмена', callback_data: `purchase_cancel_${leadId}` }
       ]]}
     });
+    return;
   }
 
 });
@@ -375,22 +450,24 @@ app.get('/admin/stats', authMiddleware, async (req, res) => {
   const todayRes  = await pool.query(`SELECT COUNT(*) FROM leads ${whereClause ? whereClause + ' AND' : 'WHERE'} created_at::date = CURRENT_DATE`, params);
   const visitsRes = await pool.query(`SELECT count FROM visits WHERE id=1`);
 
-  const days = [];
+  // 7 дней одним запросом вместо 7 отдельных
+  const byDayRes = await pool.query(
+    `SELECT created_at::date AS day, COUNT(*) AS count FROM leads
+     ${whereClause ? whereClause + ' AND' : 'WHERE'} created_at >= CURRENT_DATE - INTERVAL '6 days'
+     GROUP BY created_at::date ORDER BY day`, params
+  );
+  const byDay = {};
   for (let i = 6; i >= 0; i--) {
     const d = new Date(); d.setDate(d.getDate() - i);
-    const dateStr = d.toISOString().slice(0,10);
-    const dayParams = sees ? [sees, dateStr] : [dateStr];
-    const dayWhere  = sees ? `WHERE buyer=$1 AND created_at::date = $2::date` : `WHERE created_at::date = $1::date`;
-    const r = await pool.query(`SELECT COUNT(*) FROM leads ${dayWhere}`, dayParams);
-    days.push({ date: dateStr, count: parseInt(r.rows[0].count) });
+    byDay[d.toISOString().slice(0,10)] = 0;
   }
+  byDayRes.rows.forEach(r => { byDay[r.day.toISOString().slice(0,10)] = parseInt(r.count); });
 
-  res.json({
-    total:  parseInt(totalRes.rows[0].count),
-    today:  parseInt(todayRes.rows[0].count),
-    visits: parseInt(visitsRes.rows[0]?.count || 0),
-    days
-  });
+  const total  = parseInt(totalRes.rows[0].count);
+  const visits = parseInt(visitsRes.rows[0]?.count || 0);
+  const cr = visits > 0 ? ((total / visits) * 100).toFixed(1) : '0.0';
+
+  res.json({ total, today: parseInt(todayRes.rows[0].count), visits, cr, byDay });
 });
 
 app.get('/admin/leads', authMiddleware, async (req, res) => {
@@ -413,36 +490,21 @@ app.get('/admin/leads', authMiddleware, async (req, res) => {
     [...params, parseInt(limit), offset]
   );
 
-  res.json({ total: parseInt(countRes.rows[0].count), leads: leadsRes.rows });
+  const total = parseInt(countRes.rows[0].count);
+  const lim = parseInt(limit);
+  const pg = parseInt(page);
+  const pages = Math.ceil(total / lim) || 1;
+  res.json({ total, leads: leadsRes.rows, page: pg, pages });
 });
 
 app.post('/admin/purchase/:id', authMiddleware, async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM leads WHERE id=$1`, [req.params.id]);
   if (!rows[0]) return res.status(404).json({ ok: false, error: 'Lead not found' });
   const lead = rows[0];
+  if (lead.status === 'purchased') return res.status(400).json({ ok: false, error: 'Purchase уже отправлен ранее' });
   lead.utms = lead.utms || {};
-  const pixelId = lead.utms.pixel_id;
-  const accessToken = FB_PIXELS[pixelId];
-  if (!pixelId || !accessToken) return res.status(400).json({ ok: false, error: 'No pixel_id or token for this lead' });
-  const eventTime = Math.floor(Date.now() / 1000);
-  const hash = (val) => val ? crypto.createHash('sha256').update(val.trim().toLowerCase()).digest('hex') : undefined;
-  const userData = {};
-  if (lead.email) userData.em = [hash(lead.email)];
-  if (lead.phone) userData.ph = [hash(lead.phone.replace(/\D/g,''))];
-  if (lead.ip)    userData.client_ip_address = lead.ip;
-  const payload = {
-    data: [{
-      event_name: 'Purchase',
-      event_time: eventTime,
-      action_source: 'website',
-      event_source_url: lead.utms.landing || '',
-      user_data: userData,
-      custom_data: { currency: 'USD', value: 500 }
-    }]
-  };
-  if (process.env.FB_TEST_CODE) payload.test_event_code = process.env.FB_TEST_CODE;
-  const result = await httpsPost('graph.facebook.com', `/v19.0/${pixelId}/events?access_token=${accessToken}`, payload);
-  console.log('[FB CAPI Purchase CRM]', result.status, result.body.slice(0, 150));
+  const result = await sendFBPurchase(lead);
+  if (!result) return res.status(400).json({ ok: false, error: 'No pixel_id or token for this lead' });
   if (result.status === 200) {
     await pool.query(`UPDATE leads SET status='purchased' WHERE id=$1`, [req.params.id]);
     res.json({ ok: true });
@@ -476,6 +538,93 @@ app.get('/admin/export.csv', authMiddleware, async (req, res) => {
   res.send(csv);
 });
 
+// ── Pixels CRUD ──────────────────────────────────────────
+
+// Список пикселей (байер видит свои, админ — все)
+app.get('/admin/pixels', authMiddleware, async (req, res) => {
+  const sees = (!req.buyer.isSuper) ? (BUYERS[req.buyer.login]?.sees || req.buyer.name) : null;
+  const where = sees ? `WHERE buyer=$1` : '';
+  const params = sees ? [sees] : [];
+  const { rows } = await pool.query(`SELECT pixel_id, buyer, label, test_code, created_at FROM pixels ${where} ORDER BY created_at DESC`, params);
+  res.json({ pixels: rows });
+});
+
+// Добавить пиксель
+app.post('/admin/pixels', authMiddleware, async (req, res) => {
+  const { pixel_id, access_token, label, test_code } = req.body;
+  if (!pixel_id || !access_token) return res.status(400).json({ ok: false, error: 'pixel_id и access_token обязательны' });
+  const buyer = req.buyer.isSuper ? (req.body.buyer || req.buyer.name) : (BUYERS[req.buyer.login]?.sees || req.buyer.name);
+  try {
+    await pool.query(
+      `INSERT INTO pixels (pixel_id, access_token, buyer, label, test_code) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (pixel_id) DO UPDATE SET access_token=$2, buyer=$3, label=$4, test_code=$5`,
+      [pixel_id.trim(), access_token.trim(), buyer, label || '', test_code || '']
+    );
+    await refreshPixelCache();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// Обновить токен пикселя
+app.put('/admin/pixels/:pixel_id', authMiddleware, async (req, res) => {
+  const { access_token, label, buyer: newBuyer, test_code } = req.body;
+  const pid = req.params.pixel_id;
+  if (!req.buyer.isSuper) {
+    const sees = BUYERS[req.buyer.login]?.sees || req.buyer.name;
+    const { rows } = await pool.query(`SELECT buyer FROM pixels WHERE pixel_id=$1`, [pid]);
+    if (!rows[0] || rows[0].buyer !== sees) return res.status(403).json({ ok: false, error: 'Нет доступа' });
+  }
+  const updates = [];
+  const params = [];
+  let idx = 1;
+  if (access_token) { updates.push(`access_token=$${idx++}`); params.push(access_token.trim()); }
+  if (label !== undefined) { updates.push(`label=$${idx++}`); params.push(label); }
+  if (newBuyer && req.buyer.isSuper) { updates.push(`buyer=$${idx++}`); params.push(newBuyer); }
+  if (test_code !== undefined) { updates.push(`test_code=$${idx++}`); params.push(test_code); }
+  if (!updates.length) return res.status(400).json({ ok: false, error: 'Нечего обновлять' });
+  params.push(pid);
+  await pool.query(`UPDATE pixels SET ${updates.join(',')} WHERE pixel_id=$${idx}`, params);
+  await refreshPixelCache();
+  res.json({ ok: true });
+});
+
+// Удалить пиксель
+app.delete('/admin/pixels/:pixel_id', authMiddleware, async (req, res) => {
+  const pid = req.params.pixel_id;
+  if (!req.buyer.isSuper) {
+    const sees = BUYERS[req.buyer.login]?.sees || req.buyer.name;
+    const { rows } = await pool.query(`SELECT buyer FROM pixels WHERE pixel_id=$1`, [pid]);
+    if (!rows[0] || rows[0].buyer !== sees) return res.status(403).json({ ok: false, error: 'Нет доступа' });
+  }
+  await pool.query(`DELETE FROM pixels WHERE pixel_id=$1`, [pid]);
+  await refreshPixelCache();
+  res.json({ ok: true });
+});
+
+// Тест CAPI пикселя — отправляет тестовое событие
+app.post('/admin/pixels/:pixel_id/test', authMiddleware, async (req, res) => {
+  const pid = req.params.pixel_id;
+  const token = FB_PIXELS[pid];
+  if (!token) return res.status(404).json({ ok: false, error: 'Пиксель не найден' });
+  const eventTime = Math.floor(Date.now() / 1000);
+  const payload = {
+    data: [{
+      event_name: 'Lead',
+      event_time: eventTime,
+      event_id: `test_${eventTime}`,
+      action_source: 'website',
+      user_data: { em: [crypto.createHash('sha256').update('test@test.com').digest('hex')] },
+    }],
+    test_event_code: req.body.test_code || 'TEST00000'
+  };
+  const result = await httpsPost('graph.facebook.com', `/v21.0/${pid}/events?access_token=${token}`, payload);
+  let body;
+  try { body = JSON.parse(result.body); } catch(e) { body = result.body; }
+  res.json({ ok: result.status === 200, status: result.status, response: body });
+});
+
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
 
@@ -489,3 +638,7 @@ app.listen(PORT, async () => {
     { url: 'https://backend-land.onrender.com/tg-webhook', allowed_updates: ['callback_query'] });
   console.log('[TG webhook]', r.status, r.body.slice(0, 100));
 });
+
+// ── Global error handlers ────────────────────────────────
+pool.on('error', (err) => console.error('[PG pool error]', err.message));
+process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
