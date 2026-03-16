@@ -36,12 +36,34 @@ async function initDB() {
       test_code TEXT DEFAULT '',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS buyers (
+      login TEXT PRIMARY KEY,
+      password TEXT NOT NULL,
+      name TEXT NOT NULL,
+      geo TEXT DEFAULT '',
+      sees TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
-  // Добавляем колонку test_code если таблица уже существовала без неё
   await pool.query(`ALTER TABLE pixels ADD COLUMN IF NOT EXISTS test_code TEXT DEFAULT ''`).catch(()=>{});
-  // Seed из ENV — только если таблица пустая (первый запуск)
-  const { rows } = await pool.query(`SELECT COUNT(*) FROM pixels`);
-  if (parseInt(rows[0].count) === 0) {
+
+  // Seed buyers — только если таблица пустая
+  const { rows: bRows } = await pool.query(`SELECT COUNT(*) FROM buyers`);
+  if (parseInt(bRows[0].count) === 0) {
+    const buyerSeeds = [
+      ['gpttrade', 'pass123', 'pumba',    'MX', 'pumba'],
+      ['nepravda', 'pass456', 'nepravda', 'MX', 'nepravda'],
+    ];
+    for (const [login, password, name, geo, sees] of buyerSeeds) {
+      await pool.query(`INSERT INTO buyers (login, password, name, geo, sees) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+        [login, password, name, geo, sees]);
+    }
+    console.log('[DB] buyers seeded');
+  }
+
+  // Seed pixels — только если таблица пустая
+  const { rows: pRows } = await pool.query(`SELECT COUNT(*) FROM pixels`);
+  if (parseInt(pRows[0].count) === 0) {
     const seeds = [
       ['3259080404253744', process.env.FB_TOKEN_PUMBA,      'pumba',    'pumba основной'],
       ['1237424481354094', process.env.FB_TOKEN_NEPRAVDA_1, 'nepravda', 'nepravda pixel 1'],
@@ -57,16 +79,29 @@ async function initDB() {
     }
     console.log('[DB] pixels seeded from ENV');
   }
+
+  await refreshBuyersCache();
   await refreshPixelCache();
   console.log('[DB] initialized');
 }
 
-// ── Байеры ──────────────────────────────────────────────
-const DEFAULT_BUYERS = {
-  'gpttrade': { password: 'pass123', name: 'pumba',    geo: 'MX', sees: 'pumba'    },
-  'nepravda': { password: 'pass456', name: 'nepravda', geo: 'MX', sees: 'nepravda' },
-};
-const BUYERS = process.env.BUYERS_JSON ? JSON.parse(process.env.BUYERS_JSON) : DEFAULT_BUYERS;
+// ── Байеры — динамический кеш из БД ─────────────────────
+let BUYERS = {}; // login -> { password, name, geo, sees }
+
+async function refreshBuyersCache() {
+  try {
+    const { rows } = await pool.query(`SELECT login, password, name, geo, sees FROM buyers`);
+    const newBuyers = {};
+    rows.forEach(r => {
+      newBuyers[r.login] = { password: r.password, name: r.name, geo: r.geo, sees: r.sees };
+    });
+    BUYERS = newBuyers;
+    console.log(`[BUYERS] cache refreshed: ${rows.length} buyers`);
+  } catch (err) {
+    console.error('[BUYERS] cache refresh error:', err.message);
+  }
+}
+
 const SUPER_LOGIN    = process.env.SUPER_LOGIN    || 'admin';
 const SUPER_PASSWORD = process.env.SUPER_PASSWORD || 'supersecret2025';
 
@@ -627,6 +662,72 @@ app.post('/admin/pixels/:pixel_id/test', authMiddleware, async (req, res) => {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
+// ── Buyers CRUD (только admin) ──────────────────────────
+
+function requireSuper(req, res, next) {
+  if (!req.buyer.isSuper) return res.status(403).json({ ok: false, error: 'Только admin' });
+  next();
+}
+
+// Список байеров
+app.get('/admin/buyers', authMiddleware, requireSuper, async (req, res) => {
+  const { rows } = await pool.query(`SELECT login, name, geo, sees, created_at FROM buyers ORDER BY created_at`);
+  // Подтягиваем кол-во пикселей и лидов для каждого
+  const result = [];
+  for (const b of rows) {
+    const pxRes = await pool.query(`SELECT COUNT(*) FROM pixels WHERE buyer=$1`, [b.sees]);
+    const leadRes = await pool.query(`SELECT COUNT(*) FROM leads WHERE buyer=$1`, [b.sees]);
+    result.push({ ...b, pixels: parseInt(pxRes.rows[0].count), leads: parseInt(leadRes.rows[0].count) });
+  }
+  res.json({ buyers: result });
+});
+
+// Добавить байера
+app.post('/admin/buyers', authMiddleware, requireSuper, async (req, res) => {
+  const { login, password, name, geo, sees } = req.body;
+  if (!login || !password || !name) return res.status(400).json({ ok: false, error: 'login, password и name обязательны' });
+  if (login === SUPER_LOGIN) return res.status(400).json({ ok: false, error: 'Этот логин зарезервирован' });
+  try {
+    await pool.query(
+      `INSERT INTO buyers (login, password, name, geo, sees) VALUES ($1,$2,$3,$4,$5)`,
+      [login.trim(), password, name.trim(), geo || '', (sees || name).trim()]
+    );
+    await refreshBuyersCache();
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ ok: false, error: 'Логин уже существует' });
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// Обновить байера
+app.put('/admin/buyers/:login', authMiddleware, requireSuper, async (req, res) => {
+  const { password, name, geo, sees } = req.body;
+  const buyerLogin = req.params.login;
+  const updates = [];
+  const params = [];
+  let idx = 1;
+  if (password) { updates.push(`password=$${idx++}`); params.push(password); }
+  if (name) { updates.push(`name=$${idx++}`); params.push(name.trim()); }
+  if (geo !== undefined) { updates.push(`geo=$${idx++}`); params.push(geo); }
+  if (sees) { updates.push(`sees=$${idx++}`); params.push(sees.trim()); }
+  if (!updates.length) return res.status(400).json({ ok: false, error: 'Нечего обновлять' });
+  params.push(buyerLogin);
+  const result = await pool.query(`UPDATE buyers SET ${updates.join(',')} WHERE login=$${idx}`, params);
+  if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Байер не найден' });
+  await refreshBuyersCache();
+  res.json({ ok: true });
+});
+
+// Удалить байера
+app.delete('/admin/buyers/:login', authMiddleware, requireSuper, async (req, res) => {
+  const buyerLogin = req.params.login;
+  const result = await pool.query(`DELETE FROM buyers WHERE login=$1`, [buyerLogin]);
+  if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Байер не найден' });
+  await refreshBuyersCache();
+  res.json({ ok: true });
+});
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, async () => {

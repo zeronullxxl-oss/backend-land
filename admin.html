@@ -168,6 +168,10 @@ td{padding:14px 20px;font-size:14px}
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
       <span>Пиксели</span>
     </div>
+    <div class="nav-item" onclick="showTab('buyers')" id="nav-buyers" style="display:none">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+      <span>Байеры</span>
+    </div>
     <div class="sidebar-bottom">
       <div style="font-size:12px;color:var(--muted);margin-bottom:10px;padding:0 4px">
         <span id="buyerLabel" style="font-weight:600;color:var(--text)"></span>
@@ -278,6 +282,50 @@ td{padding:14px 20px;font-size:14px}
         </div>
       </div>
 
+      <!-- Buyers tab (admin only) -->
+      <div class="tab-pane" id="tab-buyers">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:24px">
+          <div style="font-size:14px;font-weight:600;margin-bottom:16px">Добавить байера</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+            <div style="flex:1;min-width:120px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Логин</label>
+              <input class="login-input" id="byLogin" placeholder="newbuyer" style="margin:0;padding:10px 12px;font-size:13px">
+            </div>
+            <div style="flex:1;min-width:120px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Пароль</label>
+              <input class="login-input" id="byPassword" placeholder="pass789" style="margin:0;padding:10px 12px;font-size:13px">
+            </div>
+            <div style="flex:1;min-width:120px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Имя (buyer)</label>
+              <input class="login-input" id="byName" placeholder="newbuyer" style="margin:0;padding:10px 12px;font-size:13px">
+            </div>
+            <div style="flex:0.7;min-width:80px">
+              <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Гео</label>
+              <input class="login-input" id="byGeo" placeholder="MX" style="margin:0;padding:10px 12px;font-size:13px" maxlength="5">
+            </div>
+            <button class="login-btn" onclick="addBuyer()" style="padding:10px 20px;border-radius:10px;font-size:13px;width:auto;white-space:nowrap">+ Добавить</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Логин</th>
+                <th>Имя (buyer)</th>
+                <th>Гео</th>
+                <th>Пиксели</th>
+                <th>Лиды</th>
+                <th>Дата</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="buyersBody">
+              <tr><td colspan="7"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
@@ -316,7 +364,10 @@ async function login() {
     document.getElementById('loginScreen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
     // Показываем поле buyer для админа в форме пикселей
-    if (isSuper) document.getElementById('pxBuyerWrap').style.display = 'block';
+    if (isSuper) {
+      document.getElementById('pxBuyerWrap').style.display = 'block';
+      document.getElementById('nav-buyers').style.display = '';
+    }
     loadStats();
     loadLeads();
   } catch {
@@ -340,16 +391,18 @@ function showTab(tab) {
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + tab).classList.add('active');
   document.getElementById('nav-' + tab).classList.add('active');
-  const titles = { dashboard: 'Дашборд', leads: 'Лиды', pixels: 'Пиксели FB CAPI' };
+  const titles = { dashboard: 'Дашборд', leads: 'Лиды', pixels: 'Пиксели FB CAPI', buyers: 'Управление байерами' };
   document.getElementById('topbarTitle').textContent = titles[tab] || tab;
   if (tab === 'leads') loadLeads();
   if (tab === 'dashboard') loadStats();
   if (tab === 'pixels') loadPixels();
+  if (tab === 'buyers') loadBuyers();
 }
 
 function refreshCurrent() {
   if (currentTab === 'dashboard') loadStats();
   else if (currentTab === 'pixels') loadPixels();
+  else if (currentTab === 'buyers') loadBuyers();
   else loadLeads();
 }
 
@@ -489,6 +542,98 @@ function exportCSV(e) {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     });
+}
+
+// ── BUYERS ────────────────────────────────────────────────────────────────────
+async function loadBuyers() {
+  const body = document.getElementById('buyersBody');
+  body.innerHTML = '<tr><td colspan="7"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>';
+  try {
+    const r = await fetch(`${API}/admin/buyers`, {headers:{'Authorization':'Bearer '+TOKEN}});
+    const d = await r.json();
+    if (!d.buyers || !d.buyers.length) {
+      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">Байеров нет — добавьте первого</div></td></tr>';
+      return;
+    }
+    body.innerHTML = d.buyers.map(b => {
+      const dt = new Date(b.created_at);
+      const dateStr = dt.toLocaleDateString('ru',{day:'2-digit',month:'2-digit',year:'2-digit'});
+      return `<tr>
+        <td style="font-weight:500">${esc(b.login)}</td>
+        <td>${esc(b.name)}</td>
+        <td>${esc(b.geo)||'—'}</td>
+        <td><span style="background:rgba(16,163,127,0.15);color:var(--accent);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600">${b.pixels}</span></td>
+        <td style="color:var(--muted)">${b.leads}</td>
+        <td class="td-time">${dateStr}</td>
+        <td style="white-space:nowrap">
+          <button class="purchase-btn" onclick="editBuyer('${esc(b.login)}')" title="Редактировать">✏️</button>
+          <button class="del-btn" onclick="deleteBuyer('${esc(b.login)}')">✕</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    body.innerHTML = '<tr><td colspan="7"><div class="empty-state">Ошибка загрузки</div></td></tr>';
+  }
+}
+
+async function addBuyer() {
+  const login = document.getElementById('byLogin').value.trim();
+  const password = document.getElementById('byPassword').value.trim();
+  const name = document.getElementById('byName').value.trim();
+  const geo = document.getElementById('byGeo').value.trim().toUpperCase();
+  if (!login || !password || !name) { toast('Заполните логин, пароль и имя','error'); return; }
+  try {
+    const r = await fetch(`${API}/admin/buyers`, {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+      body: JSON.stringify({ login, password, name, geo, sees: name })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast('Байер добавлен','success');
+      document.getElementById('byLogin').value='';
+      document.getElementById('byPassword').value='';
+      document.getElementById('byName').value='';
+      document.getElementById('byGeo').value='';
+      loadBuyers();
+    } else { toast(d.error||'Ошибка','error'); }
+  } catch { toast('Ошибка сети','error'); }
+}
+
+async function editBuyer(login) {
+  const action = prompt('Что изменить для ' + login + '?\n1 = пароль\n2 = гео\n3 = имя (buyer name)','1');
+  if (!action) return;
+  let body = {};
+  if (action === '1') {
+    const v = prompt('Новый пароль:'); if (!v) return;
+    body.password = v;
+  } else if (action === '2') {
+    const v = prompt('Новый гео (например MX, US):'); if (v === null) return;
+    body.geo = v.toUpperCase();
+  } else if (action === '3') {
+    const v = prompt('Новое имя (buyer name):'); if (!v) return;
+    body.name = v; body.sees = v;
+  } else { toast('Неизвестный вариант','error'); return; }
+  try {
+    const r = await fetch(`${API}/admin/buyers/${login}`, {
+      method:'PUT', headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.ok) { toast('Байер обновлён','success'); loadBuyers(); }
+    else toast(d.error||'Ошибка','error');
+  } catch { toast('Ошибка сети','error'); }
+}
+
+async function deleteBuyer(login) {
+  if (!confirm('Удалить байера ' + login + '? Его лиды и пиксели останутся в БД.')) return;
+  try {
+    const r = await fetch(`${API}/admin/buyers/${login}`, {
+      method:'DELETE', headers:{'Authorization':'Bearer '+TOKEN}
+    });
+    const d = await r.json();
+    if (d.ok) { toast('Байер удалён','success'); loadBuyers(); }
+    else toast(d.error||'Ошибка','error');
+  } catch { toast('Ошибка сети','error'); }
 }
 
 // ── PIXELS ────────────────────────────────────────────────────────────────────
