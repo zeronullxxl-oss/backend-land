@@ -186,9 +186,15 @@ function sendLeadToTelegram(lead) {
     u.creative_id  ? `| creative_id: ${u.creative_id}` : null,
   ].filter(Boolean).join('\n') || '| -';
 
+  // Определяем оффер по домену из landing URL
+  let offerName = 'Unknown';
+  try {
+    const landingHost = new URL(u.landing || '').hostname.replace('www.','');
+    offerName = landingHost;
+  } catch(e) {}
   const text = [
-    `НОВЫЙ ЛИД — GPT Trade`,
-    `ID: ${lead.id.slice(0,8).toUpperCase()}`,
+    `📌 ${offerName.toUpperCase()}`,
+    `НОВЫЙ ЛИД — ID: ${lead.id.slice(0,8).toUpperCase()}`,
     ``,
     `КОНТАКТЫ`,
     `Имя: ${lead.name}`,
@@ -196,6 +202,7 @@ function sendLeadToTelegram(lead) {
     `Телефон: ${lead.phone}`,
     ``,
     `БАЙЕР: ${lead.buyer}`,
+    `ОФФЕР: ${offerName}`,
     ``,
     `ГЕО: ${lead.flag || ''} ${lead.country || '-'}${lead.city ? ', ' + lead.city : ''}`,
     ``,
