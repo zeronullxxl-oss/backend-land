@@ -310,6 +310,7 @@ td{padding:14px 20px;font-size:14px}
           <table>
             <thead>
               <tr>
+                <th>ID</th>
                 <th>Логин</th>
                 <th>Имя (buyer)</th>
                 <th>Гео</th>
@@ -320,7 +321,7 @@ td{padding:14px 20px;font-size:14px}
               </tr>
             </thead>
             <tbody id="buyersBody">
-              <tr><td colspan="7"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>
+              <tr><td colspan="8"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>
             </tbody>
           </table>
         </div>
@@ -547,18 +548,19 @@ function exportCSV(e) {
 // ── BUYERS ────────────────────────────────────────────────────────────────────
 async function loadBuyers() {
   const body = document.getElementById('buyersBody');
-  body.innerHTML = '<tr><td colspan="7"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>';
+  body.innerHTML = '<tr><td colspan="8"><div class="loading"><div class="spinner"></div> Загрузка…</div></td></tr>';
   try {
     const r = await fetch(`${API}/admin/buyers`, {headers:{'Authorization':'Bearer '+TOKEN}});
     const d = await r.json();
     if (!d.buyers || !d.buyers.length) {
-      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">Байеров нет — добавьте первого</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="8"><div class="empty-state">Байеров нет — добавьте первого</div></td></tr>';
       return;
     }
     body.innerHTML = d.buyers.map(b => {
       const dt = new Date(b.created_at);
       const dateStr = dt.toLocaleDateString('ru',{day:'2-digit',month:'2-digit',year:'2-digit'});
       return `<tr>
+        <td><span style="background:rgba(16,163,127,0.15);color:var(--accent);border-radius:6px;padding:2px 8px;font-size:12px;font-weight:700">${b.buyer_id}</span></td>
         <td style="font-weight:500">${esc(b.login)}</td>
         <td>${esc(b.name)}</td>
         <td>${esc(b.geo)||'—'}</td>
@@ -572,7 +574,7 @@ async function loadBuyers() {
       </tr>`;
     }).join('');
   } catch(e) {
-    body.innerHTML = '<tr><td colspan="7"><div class="empty-state">Ошибка загрузки</div></td></tr>';
+    body.innerHTML = '<tr><td colspan="8"><div class="empty-state">Ошибка загрузки</div></td></tr>';
   }
 }
 

@@ -42,22 +42,26 @@ async function initDB() {
       name TEXT NOT NULL,
       geo TEXT DEFAULT '',
       sees TEXT NOT NULL,
+      buyer_id SERIAL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
   await pool.query(`ALTER TABLE pixels ADD COLUMN IF NOT EXISTS test_code TEXT DEFAULT ''`).catch(()=>{});
+  await pool.query(`ALTER TABLE buyers ADD COLUMN IF NOT EXISTS buyer_id SERIAL`).catch(()=>{});
 
   // Seed buyers — только если таблица пустая
   const { rows: bRows } = await pool.query(`SELECT COUNT(*) FROM buyers`);
   if (parseInt(bRows[0].count) === 0) {
     const buyerSeeds = [
-      ['gpttrade', 'pass123', 'pumba',    'MX', 'pumba'],
-      ['nepravda', 'pass456', 'nepravda', 'MX', 'nepravda'],
+      ['gpttrade', 'pass123', 'pumba',    'MX', 'pumba',    1],
+      ['nepravda', 'pass456', 'nepravda', 'MX', 'nepravda', 2],
     ];
-    for (const [login, password, name, geo, sees] of buyerSeeds) {
-      await pool.query(`INSERT INTO buyers (login, password, name, geo, sees) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
-        [login, password, name, geo, sees]);
+    for (const [login, password, name, geo, sees, bid] of buyerSeeds) {
+      await pool.query(`INSERT INTO buyers (login, password, name, geo, sees, buyer_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+        [login, password, name, geo, sees, bid]);
     }
+    // Обновляем sequence чтобы следующий buyer_id начинался с 3
+    await pool.query(`SELECT setval(pg_get_serial_sequence('buyers','buyer_id'), GREATEST((SELECT MAX(buyer_id) FROM buyers), 2))`);
     console.log('[DB] buyers seeded');
   }
 
@@ -86,14 +90,14 @@ async function initDB() {
 }
 
 // ── Байеры — динамический кеш из БД ─────────────────────
-let BUYERS = {}; // login -> { password, name, geo, sees }
+let BUYERS = {}; // login -> { password, name, geo, sees, buyer_id }
 
 async function refreshBuyersCache() {
   try {
-    const { rows } = await pool.query(`SELECT login, password, name, geo, sees FROM buyers`);
+    const { rows } = await pool.query(`SELECT login, password, name, geo, sees, buyer_id FROM buyers`);
     const newBuyers = {};
     rows.forEach(r => {
-      newBuyers[r.login] = { password: r.password, name: r.name, geo: r.geo, sees: r.sees };
+      newBuyers[r.login] = { password: r.password, name: r.name, geo: r.geo, sees: r.sees, buyer_id: r.buyer_id };
     });
     BUYERS = newBuyers;
     console.log(`[BUYERS] cache refreshed: ${rows.length} buyers`);
@@ -324,7 +328,19 @@ app.use((req, res, next) => {
   next();
 });
 
+// Обёртка для async route handlers (Express 4 не ловит rejected promises)
+const asyncWrap = fn => (req, res, next) => fn(req, res, next).catch(next);
+
 // ── Routes ────────────────────────────────────────────────
+
+// Публичный маппинг buyer_id → buyer name (для фронта)
+app.get('/buyer-map', (req, res) => {
+  const map = {};
+  Object.values(BUYERS).forEach(b => {
+    if (b.buyer_id) map[b.buyer_id] = b.sees;
+  });
+  res.json(map);
+});
 
 app.post('/lead', async (req, res) => {
   try {
@@ -378,6 +394,7 @@ app.post('/visit', async (req, res) => {
 
 app.post('/tg-webhook', async (req, res) => {
   res.sendStatus(200);
+  try {
   const cb = req.body && req.body.callback_query;
   if (!cb) return;
   const data_str = cb.data || '';
@@ -467,6 +484,9 @@ app.post('/tg-webhook', async (req, res) => {
     return;
   }
 
+  } catch (err) {
+    console.error('[TG WEBHOOK ERROR]', err.message);
+  }
 });
 
 app.post('/admin/auth', (req, res) => {
@@ -476,7 +496,7 @@ app.post('/admin/auth', (req, res) => {
   res.json({ ok: true, token: `${login}:${password}`, name: buyer.name, isSuper: buyer.isSuper });
 });
 
-app.get('/admin/stats', authMiddleware, async (req, res) => {
+app.get('/admin/stats', authMiddleware, asyncWrap(async (req, res) => {
   const sees = (!req.buyer.isSuper) ? (BUYERS[req.buyer.login]?.sees || req.buyer.name) : null;
   const whereClause = sees ? `WHERE buyer=$1` : '';
   const params = sees ? [sees] : [];
@@ -503,9 +523,9 @@ app.get('/admin/stats', authMiddleware, async (req, res) => {
   const cr = visits > 0 ? ((total / visits) * 100).toFixed(1) : '0.0';
 
   res.json({ total, today: parseInt(todayRes.rows[0].count), visits, cr, byDay });
-});
+}));
 
-app.get('/admin/leads', authMiddleware, async (req, res) => {
+app.get('/admin/leads', authMiddleware, asyncWrap(async (req, res) => {
   const sees = (!req.buyer.isSuper) ? (BUYERS[req.buyer.login]?.sees || req.buyer.name) : null;
   const { search = '', page = 1, limit = 20 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -530,9 +550,9 @@ app.get('/admin/leads', authMiddleware, async (req, res) => {
   const pg = parseInt(page);
   const pages = Math.ceil(total / lim) || 1;
   res.json({ total, leads: leadsRes.rows, page: pg, pages });
-});
+}));
 
-app.post('/admin/purchase/:id', authMiddleware, async (req, res) => {
+app.post('/admin/purchase/:id', authMiddleware, asyncWrap(async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM leads WHERE id=$1`, [req.params.id]);
   if (!rows[0]) return res.status(404).json({ ok: false, error: 'Lead not found' });
   const lead = rows[0];
@@ -546,14 +566,14 @@ app.post('/admin/purchase/:id', authMiddleware, async (req, res) => {
   } else {
     res.status(400).json({ ok: false, error: result.body });
   }
-});
+}));
 
-app.delete('/admin/lead/:id', authMiddleware, async (req, res) => {
+app.delete('/admin/lead/:id', authMiddleware, asyncWrap(async (req, res) => {
   await pool.query(`DELETE FROM leads WHERE id=$1`, [req.params.id]);
   res.json({ ok: true });
-});
+}));
 
-app.get('/admin/export.csv', authMiddleware, async (req, res) => {
+app.get('/admin/export.csv', authMiddleware, asyncWrap(async (req, res) => {
   const sees = (!req.buyer.isSuper) ? (BUYERS[req.buyer.login]?.sees || req.buyer.name) : null;
   const where = sees ? `WHERE buyer=$1` : '';
   const params = sees ? [sees] : [];
@@ -571,18 +591,18 @@ app.get('/admin/export.csv', authMiddleware, async (req, res) => {
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="leads.csv"');
   res.send(csv);
-});
+}));
 
 // ── Pixels CRUD ──────────────────────────────────────────
 
 // Список пикселей (байер видит свои, админ — все)
-app.get('/admin/pixels', authMiddleware, async (req, res) => {
+app.get('/admin/pixels', authMiddleware, asyncWrap(async (req, res) => {
   const sees = (!req.buyer.isSuper) ? (BUYERS[req.buyer.login]?.sees || req.buyer.name) : null;
   const where = sees ? `WHERE buyer=$1` : '';
   const params = sees ? [sees] : [];
   const { rows } = await pool.query(`SELECT pixel_id, buyer, label, test_code, created_at FROM pixels ${where} ORDER BY created_at DESC`, params);
   res.json({ pixels: rows });
-});
+}));
 
 // Добавить пиксель
 app.post('/admin/pixels', authMiddleware, async (req, res) => {
@@ -603,7 +623,7 @@ app.post('/admin/pixels', authMiddleware, async (req, res) => {
 });
 
 // Обновить токен пикселя
-app.put('/admin/pixels/:pixel_id', authMiddleware, async (req, res) => {
+app.put('/admin/pixels/:pixel_id', authMiddleware, asyncWrap(async (req, res) => {
   const { access_token, label, buyer: newBuyer, test_code } = req.body;
   const pid = req.params.pixel_id;
   if (!req.buyer.isSuper) {
@@ -623,10 +643,10 @@ app.put('/admin/pixels/:pixel_id', authMiddleware, async (req, res) => {
   await pool.query(`UPDATE pixels SET ${updates.join(',')} WHERE pixel_id=$${idx}`, params);
   await refreshPixelCache();
   res.json({ ok: true });
-});
+}));
 
 // Удалить пиксель
-app.delete('/admin/pixels/:pixel_id', authMiddleware, async (req, res) => {
+app.delete('/admin/pixels/:pixel_id', authMiddleware, asyncWrap(async (req, res) => {
   const pid = req.params.pixel_id;
   if (!req.buyer.isSuper) {
     const sees = BUYERS[req.buyer.login]?.sees || req.buyer.name;
@@ -636,10 +656,10 @@ app.delete('/admin/pixels/:pixel_id', authMiddleware, async (req, res) => {
   await pool.query(`DELETE FROM pixels WHERE pixel_id=$1`, [pid]);
   await refreshPixelCache();
   res.json({ ok: true });
-});
+}));
 
 // Тест CAPI пикселя — отправляет тестовое событие
-app.post('/admin/pixels/:pixel_id/test', authMiddleware, async (req, res) => {
+app.post('/admin/pixels/:pixel_id/test', authMiddleware, asyncWrap(async (req, res) => {
   const pid = req.params.pixel_id;
   const token = FB_PIXELS[pid];
   if (!token) return res.status(404).json({ ok: false, error: 'Пиксель не найден' });
@@ -658,7 +678,7 @@ app.post('/admin/pixels/:pixel_id/test', authMiddleware, async (req, res) => {
   let body;
   try { body = JSON.parse(result.body); } catch(e) { body = result.body; }
   res.json({ ok: result.status === 200, status: result.status, response: body });
-});
+}));
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
@@ -671,20 +691,21 @@ function requireSuper(req, res, next) {
 }
 
 // Список байеров
-app.get('/admin/buyers', authMiddleware, requireSuper, async (req, res) => {
-  const { rows } = await pool.query(`SELECT login, name, geo, sees, created_at FROM buyers ORDER BY created_at`);
-  // Подтягиваем кол-во пикселей и лидов для каждого
-  const result = [];
-  for (const b of rows) {
-    const pxRes = await pool.query(`SELECT COUNT(*) FROM pixels WHERE buyer=$1`, [b.sees]);
-    const leadRes = await pool.query(`SELECT COUNT(*) FROM leads WHERE buyer=$1`, [b.sees]);
-    result.push({ ...b, pixels: parseInt(pxRes.rows[0].count), leads: parseInt(leadRes.rows[0].count) });
-  }
-  res.json({ buyers: result });
-});
+app.get('/admin/buyers', authMiddleware, requireSuper, asyncWrap(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT b.login, b.name, b.geo, b.sees, b.buyer_id, b.created_at,
+      COALESCE(px.cnt, 0)::int AS pixels,
+      COALESCE(ld.cnt, 0)::int AS leads
+    FROM buyers b
+    LEFT JOIN (SELECT buyer, COUNT(*) AS cnt FROM pixels GROUP BY buyer) px ON px.buyer = b.sees
+    LEFT JOIN (SELECT buyer, COUNT(*) AS cnt FROM leads GROUP BY buyer) ld ON ld.buyer = b.sees
+    ORDER BY b.created_at
+  `);
+  res.json({ buyers: rows });
+}));
 
 // Добавить байера
-app.post('/admin/buyers', authMiddleware, requireSuper, async (req, res) => {
+app.post('/admin/buyers', authMiddleware, requireSuper, asyncWrap(async (req, res) => {
   const { login, password, name, geo, sees } = req.body;
   if (!login || !password || !name) return res.status(400).json({ ok: false, error: 'login, password и name обязательны' });
   if (login === SUPER_LOGIN) return res.status(400).json({ ok: false, error: 'Этот логин зарезервирован' });
@@ -699,10 +720,10 @@ app.post('/admin/buyers', authMiddleware, requireSuper, async (req, res) => {
     if (err.code === '23505') return res.status(400).json({ ok: false, error: 'Логин уже существует' });
     res.status(400).json({ ok: false, error: err.message });
   }
-});
+}));
 
 // Обновить байера
-app.put('/admin/buyers/:login', authMiddleware, requireSuper, async (req, res) => {
+app.put('/admin/buyers/:login', authMiddleware, requireSuper, asyncWrap(async (req, res) => {
   const { password, name, geo, sees } = req.body;
   const buyerLogin = req.params.login;
   const updates = [];
@@ -718,15 +739,21 @@ app.put('/admin/buyers/:login', authMiddleware, requireSuper, async (req, res) =
   if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Байер не найден' });
   await refreshBuyersCache();
   res.json({ ok: true });
-});
+}));
 
 // Удалить байера
-app.delete('/admin/buyers/:login', authMiddleware, requireSuper, async (req, res) => {
+app.delete('/admin/buyers/:login', authMiddleware, requireSuper, asyncWrap(async (req, res) => {
   const buyerLogin = req.params.login;
   const result = await pool.query(`DELETE FROM buyers WHERE login=$1`, [buyerLogin]);
   if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Байер не найден' });
   await refreshBuyersCache();
   res.json({ ok: true });
+}));
+
+// ── Global Express error handler ─────────────────────────
+app.use((err, req, res, next) => {
+  console.error('[EXPRESS ERROR]', req.method, req.path, err.message);
+  if (!res.headersSent) res.status(500).json({ ok: false, error: 'Internal server error' });
 });
 
 // ── Start ─────────────────────────────────────────────────
