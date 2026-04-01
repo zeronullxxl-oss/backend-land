@@ -210,6 +210,7 @@ function sendLeadToTelegram(lead) {
     utmLines,
     u.fbclid ? `fbclid: ${u.fbclid.slice(0,24)}...` : null,
     ``,
+    u.time_on_page ? `⏱ На странице: ${u.time_on_page} сек` : null,
     `IP: ${lead.ip}`,
     `${leadDate}`,
   ].filter(l => l !== null).join('\n');
